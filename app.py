@@ -195,25 +195,64 @@ def _get_investing_history(symbol, period="2y"):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_history(symbol, period="2y"):
-    # Provider 1: Yahoo Finance
-    try:
-        t = yf.Ticker(symbol)
-        df = t.history(period=period, interval="1d", auto_adjust=False)
-        if df is not None and not df.empty:
-            df = df.reset_index()
-            df.columns = [str(c).strip().title() for c in df.columns]
-            if "Datetime" in df.columns:
-                df.rename(columns={"Datetime":"Date"}, inplace=True)
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).copy()
-            if len(df) >= 60:
-                return df[[c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]]
-    except Exception:
-        pass
-    # Provider 2: Investing.com fallback for EGX symbols.
-    return _get_investing_history(symbol, period)
+def _egx_api_history(symbol, period="2y"):
+    code=symbol.replace(".CA","").upper()
+    base="https://ticker.egidegypt.com/api/Feed"
+    headers={"User-Agent":"Mozilla/5.0","Accept":"application/json, text/plain, */*"}
+    days={"1y":370,"2y":740,"5y":1850}.get(period,740)
+    end=datetime.utcnow().date(); start=end-timedelta(days=days)
+    def norm(p):
+        if isinstance(p,dict):
+            for k in ("data","result","items","history","prices","bars","values"):
+                if k in p:
+                    z=norm(p[k])
+                    if not z.empty: return z
+            if all(k in p for k in ("t","o","h","l","c")):
+                rows=[]
+                for i,t in enumerate(p.get("t",[])):
+                    try: rows.append({"Date":pd.to_datetime(float(t),unit="s"),"Open":_clean_num(p["o"][i]),"High":_clean_num(p["h"][i]),"Low":_clean_num(p["l"][i]),"Close":_clean_num(p["c"][i]),"Volume":_clean_num(p.get("v",[np.nan]*len(p["t"]))[i])})
+                    except Exception: pass
+                return pd.DataFrame(rows)
+            return pd.DataFrame()
+        if isinstance(p,list):
+            rows=[]
+            for r in p:
+                if isinstance(r,dict):
+                    d=r.get("date") or r.get("Date") or r.get("tradingDate") or r.get("time") or r.get("timestamp")
+                    o=r.get("open") or r.get("Open") or r.get("openPrice"); h=r.get("high") or r.get("High") or r.get("highPrice"); l=r.get("low") or r.get("Low") or r.get("lowPrice"); c=r.get("close") or r.get("Close") or r.get("closePrice") or r.get("price"); v=r.get("volume") or r.get("Volume") or r.get("volumeValue")
+                    if d is not None and c is not None: rows.append({"Date":d,"Open":_clean_num(o),"High":_clean_num(h),"Low":_clean_num(l),"Close":_clean_num(c),"Volume":_clean_num(v)})
+                elif isinstance(r,(list,tuple)) and len(r)>=5:
+                    d=r[0]
+                    if isinstance(d,(int,float)): d=pd.to_datetime(float(d),unit="s" if float(d)<2e10 else "ms")
+                    rows.append({"Date":d,"Open":_clean_num(r[1]),"High":_clean_num(r[2]),"Low":_clean_num(r[3]),"Close":_clean_num(r[4]),"Volume":_clean_num(r[5]) if len(r)>5 else np.nan})
+            if rows:
+                df=pd.DataFrame(rows); df["Date"]=pd.to_datetime(df["Date"],errors="coerce")
+                for c in ["Open","High","Low","Close","Volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                return df.dropna(subset=["Date","Close"]).sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
+        return pd.DataFrame()
+    attempts=[("GET",f"{base}/GetSymbolChart",{"symbol":code}),("GET",f"{base}/GetSymbolChart",{"symbolName":code}),("GET",f"{base}/GetSymbolHistories",{"symbol":code}),("GET",f"{base}/GetSymbolHistories",{"symbolName":code}),("POST",f"{base}/GetSymbolHistory",{"symbol":code,"fromDate":start.isoformat(),"toDate":end.isoformat()}),("POST",f"{base}/GetSymbolHistory",{"symbolName":code,"fromDate":start.isoformat(),"toDate":end.isoformat()})]
+    for method,url,payload in attempts:
+        try:
+            r=requests.get(url,params=payload,headers=headers,timeout=12) if method=="GET" else requests.post(url,json=payload,headers=headers,timeout=12)
+            if r.ok:
+                df=norm(r.json())
+                if len(df)>=60: return df
+        except Exception: pass
+    return pd.DataFrame()
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(symbol, period="2y"):
+    df=_egx_api_history(symbol,period)
+    if df is not None and len(df)>=60: return df
+    try:
+        t=yf.Ticker(symbol); df=t.history(period=period,interval="1d",auto_adjust=False)
+        if df is not None and not df.empty:
+            df=df.reset_index(); df.columns=[str(c).strip().title() for c in df.columns]
+            if "Datetime" in df.columns: df.rename(columns={"Datetime":"Date"},inplace=True)
+            df["Date"]=pd.to_datetime(df["Date"],errors="coerce"); df=df.dropna(subset=["Date"]).copy()
+            if len(df)>=60: return df[[c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]]
+    except Exception: pass
+    return _get_investing_history(symbol,period)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_info(symbol):
