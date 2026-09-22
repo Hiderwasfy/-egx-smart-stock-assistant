@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import re
+import json
 import requests
 import feedparser
 from datetime import datetime, timedelta
@@ -61,25 +63,167 @@ def resolve_symbol(raw):
     return s + ".CA"
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_history(symbol, period="2y"):
-    t = yf.Ticker(symbol)
-    df = t.history(period=period, interval="1d", auto_adjust=False)
-    if df is None or df.empty:
+def _investing_search(symbol):
+    """Resolve an EGX ticker to an Investing.com pair id.
+    This is a fallback provider; Yahoo remains the first provider when available.
+    """
+    q = symbol.replace(".CA", "").upper()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        r = requests.post(
+            "https://www.investing.com/search/service/searchTopBar",
+            data={"search_text": q}, headers=headers, timeout=12
+        )
+        if r.ok:
+            data = r.json()
+            for item in data.get("quotes", []):
+                exch = str(item.get("exchange", "")).upper()
+                sym = str(item.get("symbol", "")).upper()
+                if sym == q and ("CAIRO" in exch or "EGX" in exch or "EGYPT" in exch):
+                    return item
+            for item in data.get("quotes", []):
+                if str(item.get("symbol", "")).upper() == q:
+                    return item
+    except Exception:
+        pass
+    return None
+
+
+def _clean_num(v):
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan
+        if isinstance(v, str):
+            v = v.replace(",", "").replace("%", "").strip()
+            # Investing may return volume strings such as 3.15M / 501.09K
+            m = re.fullmatch(r"([-+]?\d*\.?\d+)\s*([KMB])?", v, flags=re.I)
+            if m:
+                x = float(m.group(1)); u = (m.group(2) or "").upper()
+                return x * {"K":1e3,"M":1e6,"B":1e9}.get(u,1)
+        return float(v)
+    except Exception:
+        return np.nan
+
+
+def _parse_investing_json(payload):
+    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
         return pd.DataFrame()
-    df = df.reset_index()
-    df.columns = [str(c).strip().title() for c in df.columns]
-    if "Datetime" in df.columns:
-        df.rename(columns={"Datetime":"Date"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    return df.dropna(subset=["Date"]).copy()
+    out=[]
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        date = r.get("date") or r.get("rowDate") or r.get("rowDateRaw") or r.get("timestamp")
+        o = r.get("price_open", r.get("open", r.get("rowOpen")))
+        h = r.get("price_high", r.get("high", r.get("rowHigh")))
+        l = r.get("price_low", r.get("low", r.get("rowLow")))
+        c = r.get("price_close", r.get("close", r.get("rowClose")))
+        v = r.get("volume", r.get("rowVolume", r.get("volumeRaw")))
+        if date is None or c is None:
+            continue
+        out.append({"Date":date,"Open":_clean_num(o),"High":_clean_num(h),"Low":_clean_num(l),"Close":_clean_num(c),"Volume":_clean_num(v)})
+    if not out:
+        return pd.DataFrame()
+    df=pd.DataFrame(out)
+    df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
+    for c in ["Open","High","Low","Close","Volume"]:
+        df[c]=pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["Date","Close"]).sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
+
+
+def _get_investing_history(symbol, period="2y"):
+    found = _investing_search(symbol)
+    if not found:
+        return pd.DataFrame()
+    pair_id = found.get("pairId") or found.get("pair_id")
+    if not pair_id:
+        return pd.DataFrame()
+    days = {"1y":370,"2y":740,"5y":1850}.get(period,740)
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=days)
+    headers = {
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
+        "Accept":"application/json, text/plain, */*",
+        "domain-id":"www",
+        "Referer":"https://www.investing.com/",
+    }
+    # Current Investing historical-data JSON endpoint.
+    try:
+        url=f"https://api.investing.com/api/financialdata/historical/{int(pair_id)}"
+        params={"start-date":start.isoformat(),"end-date":end.isoformat(),"time-frame":"Daily","add-missing-rows":"false"}
+        r=requests.get(url,params=params,headers=headers,timeout=15)
+        if r.ok:
+            df=_parse_investing_json(r.json())
+            if len(df)>=60:
+                return df
+    except Exception:
+        pass
+    # Legacy browser endpoint fallback.
+    try:
+        page_url="https://www.investing.com" + str(found.get("url", ""))
+        sess=requests.Session()
+        sess.headers.update(headers)
+        page=sess.get(page_url,timeout=15)
+        payload={
+            "curr_id":str(pair_id), "smlID":str(np.random.randint(1000000,99999999)),
+            "header":str(found.get("description") or symbol)+" Historical Data",
+            "st_date":start.strftime("%m/%d/%Y"), "end_date":end.strftime("%m/%d/%Y"),
+            "interval_sec":"Daily", "sort_col":"date", "sort_ord":"DESC", "action":"historical_data"
+        }
+        h={"User-Agent":headers["User-Agent"],"X-Requested-With":"XMLHttpRequest","Referer":page_url}
+        r=sess.post("https://www.investing.com/instruments/HistoricalDataAjax",data=payload,headers=h,timeout=15)
+        if r.ok:
+            tables=pd.read_html(r.text)
+            if tables:
+                t=tables[0]
+                rename={"Date":"Date","Price":"Close","Open":"Open","High":"High","Low":"Low","Vol.":"Volume"}
+                t=t.rename(columns=rename)
+                needed=[c for c in ["Date","Open","High","Low","Close","Volume"] if c in t.columns]
+                t=t[needed]
+                t["Date"]=pd.to_datetime(t["Date"],errors="coerce")
+                for c in ["Open","High","Low","Close"]:
+                    if c in t: t[c]=t[c].map(_clean_num)
+                if "Volume" in t: t["Volume"]=t["Volume"].map(_clean_num)
+                return t.dropna(subset=["Date","Close"]).sort_values("Date").reset_index(drop=True)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(symbol, period="2y"):
+    # Provider 1: Yahoo Finance
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval="1d", auto_adjust=False)
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            df.columns = [str(c).strip().title() for c in df.columns]
+            if "Datetime" in df.columns:
+                df.rename(columns={"Datetime":"Date"}, inplace=True)
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).copy()
+            if len(df) >= 60:
+                return df[[c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]]
+    except Exception:
+        pass
+    # Provider 2: Investing.com fallback for EGX symbols.
+    return _get_investing_history(symbol, period)
+
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_info(symbol):
     try:
         info = yf.Ticker(symbol).info
-        return info if isinstance(info, dict) else {}
+        if isinstance(info, dict) and info:
+            return info
     except Exception:
-        return {}
+        pass
+    return {}
 
 def sma(s, n): return s.rolling(n).mean()
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
