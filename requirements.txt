@@ -1,0 +1,7 @@
+streamlit>=1.48
+yfinance>=0.2.65
+pandas>=2.2
+numpy>=1.26
+plotly>=5.24
+requests>=2.32
+feedparser>=6.0
